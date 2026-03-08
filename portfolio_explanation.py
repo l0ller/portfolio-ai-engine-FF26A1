@@ -25,10 +25,28 @@ logger = logging.getLogger(__name__)
 
 
 class PortfolioExplainer:
-    """Generate AI explanations for investment portfolios."""
+    """
+    Generate AI explanations for investment portfolios.
+    
+    Provides three types of analysis using Gemini API:
+    1. Sector concentration patterns and diversification
+    2. Market cap distribution and size characteristics  
+    3. Overall risk assessment
+    """
     
     def __init__(self):
-        """Initialize with Gemini API."""
+        """
+        Initialize with Gemini API.
+        
+        Args:
+            None
+            
+        Returns:
+            None
+            
+        Raises:
+            ValueError: If GEMINI_API_KEY environment variable is not set
+        """
         api_key = os.getenv('GEMINI_API_KEY')
         if not api_key:
             raise ValueError("GEMINI_API_KEY not set in .env file")
@@ -38,7 +56,15 @@ class PortfolioExplainer:
         logger.info("✓ Gemini API configured")
     
     def load_data(self):
-        """Load input data files."""
+        """
+        Load input data files and build sector mapping.
+        
+        Args:
+            None
+            
+        Returns:
+            None
+        """
         self.investment_rules = pd.read_csv('data/assignment_investment_rules.csv')
         self.sector_data = pd.read_csv('data/assignment_sector_data.csv')
         self.mcap_data = pd.read_csv('data/assignment_mcap.csv')
@@ -50,7 +76,27 @@ class PortfolioExplainer:
         logger.info("✓ Data loaded successfully")
     
     def get_portfolio(self, strategy_idx: int = 0, year: int = 2021) -> Dict:
-        """Get portfolio for analysis."""
+        """
+        Get portfolio for analysis.
+        
+        Extracts portfolio composition and calculates sector/MCap distributions.
+        
+        Args:
+            strategy_idx: Index of strategy in investment_rules (default: 0)
+            year: Year to analyze (default: 2021)
+            
+        Returns:
+            Dictionary containing:
+            - 'strategy': Strategy name
+            - 'year': Year analyzed
+            - 'total_stocks': Number of stocks in portfolio
+            - 'stocks': List of stock names
+            - 'sector_distribution': Sector composition analysis
+            - 'mcap_distribution': Market cap statistics
+            
+        Raises:
+            ValueError: If specified year not found in data
+        """
         row = self.investment_rules.iloc[strategy_idx]
         strategy_name = str(row.iloc[0]).strip()
         year_col = str(year)
@@ -86,7 +132,20 @@ class PortfolioExplainer:
         return portfolio
     
     def _analyze_sectors(self, stocks: List[str]) -> Dict:
-        """Analyze sector distribution."""
+        """
+        Analyze sector distribution.
+        
+        Args:
+            stocks: List of stock names in portfolio
+            
+        Returns:
+            Dictionary containing sector composition metrics:
+            - 'total_sectors': Number of unique sectors
+            - 'distribution': Count of stocks per sector
+            - 'percentage': Percentage allocation per sector
+            - 'top_sector': Sector with highest concentration
+            - 'top_sector_pct': Highest sector concentration percentage
+        """
         sector_count = {}
         for stock in stocks:
             sector = self.sector_map.get(stock, 'Unknown')
@@ -109,7 +168,22 @@ class PortfolioExplainer:
         }
     
     def _analyze_mcap(self, stocks: List[str], year: int) -> Dict:
-        """Analyze MCap distribution."""
+        """
+        Analyze MCap distribution.
+        
+        Args:
+            stocks: List of stock names in portfolio
+            year: Year to analyze MCap for
+            
+        Returns:
+            Dictionary containing MCap statistics:
+            - 'count': Number of stocks with available MCap data
+            - 'avg': Average MCap (₹ Cr)
+            - 'median': Median MCap (₹ Cr)
+            - 'min': Minimum MCap (₹ Cr)
+            - 'max': Maximum MCap (₹ Cr)
+            - 'total': Total portfolio MCap (₹ Cr)
+        """
         year_col = str(year)
         mcap_values = []
         
@@ -135,15 +209,46 @@ class PortfolioExplainer:
         }
     
     def generate_explanations(self, portfolio: Dict) -> Dict:
-        """Generate three types of explanations using the modern GenAI SDK."""
+        """
+        Generate three types of explanations using the modern GenAI SDK.
+        
+        Uses few-shot prompting to maintain analytical tone and prevent hallucinations.
+        
+        Args:
+            portfolio: Dictionary containing portfolio metadata and analysis
+            
+        Returns:
+            Dictionary with keys 'sector_concentration', 'mcap_distribution', 'risk_commentary'
+            Each value contains 'prompt' and 'response' keys
+        """
         import time
         from google.genai import types
         
         explanations = {}
         
+        # Few-shot prompting to enforce professional analytics tone
+        few_shot_examples = """
+EXAMPLES OF GOOD EXPLANATIONS (Preferred Style):
+- "With 25 holdings across 8 sectors, the portfolio demonstrates moderate diversification; however, the 28% concentration in Technology presents elevated sector-specific risk, particularly given regulatory uncertainties in the software licensing space."
+- "The portfolio's average market cap of ₹450 Cr suggests mid-sized exposure; concentration in the 75th-90th percentile MCap range provides a balance between liquidity and growth potential, while the 5% small-cap allocation carries higher volatility."
+
+EXAMPLES OF POOR EXPLANATIONS (Avoid This Style):
+- "This portfolio is diversified because it has many stocks."
+- "The sector concentration looks risky."
+- "This portfolio invests in good companies with strong growth."
+
+RULES FOR RESPONSES:
+1. Always cite specific metrics (percentages, counts, values)
+2. Never invent data or numbers not provided
+3. Use professional investment terminology
+4. Discuss risk implications explicitly (e.g., "regulatory", "liquidity", "volatility")
+5. Avoid subjective judgments like "good" or "bad" without supporting analysis
+"""
+        
         # Enforce Rule 3.1: No hallucinations or invented numbers
         config = types.GenerateContentConfig(
-            system_instruction="You are a professional investment analyst. Use ONLY the provided data. Do not invent numbers."
+            system_instruction=f"""You are a professional investment analyst. {few_shot_examples}
+CRITICAL: Use ONLY the provided data. Do not invent numbers, sectors, or companies. Do not hallucinate."""
         )
 
         # Map sections to your existing prompt logic
@@ -157,12 +262,12 @@ Provide brief observations on: 1. Concentration level, 2. Top sectors, 3. Divers
             'mcap_distribution': f"""Analyze the market cap distribution of '{portfolio['strategy']}' for {portfolio['year']}.
 {portfolio['total_stocks']} stocks with {portfolio['mcap_distribution'].get('count', 0)} having MCap data.
 MCap Statistics (₹ cr): Total: {portfolio['mcap_distribution'].get('total', 0):,}, Avg: {portfolio['mcap_distribution'].get('avg', 0):,}, Median: {portfolio['mcap_distribution'].get('median', 0):,}
-Provide observations on: 1. Size distribution, 2. Avg company size, 3. Liquidity.""",
+Provide observations on: 1. Size distribution, 2. Avg company size, 3. Liquidity implications.""",
 
             'risk_commentary': f"""Provide risk commentary for '{portfolio['strategy']}' portfolio ({portfolio['year']}).
 Structure: {portfolio['total_stocks']} stocks in {portfolio['sector_distribution'].get('total_sectors', 0)} sectors.
 Top sector: {portfolio['sector_distribution'].get('top_sector', 'N/A')} ({portfolio['sector_distribution'].get('top_sector_pct', 0)}%).
-Provide assessment of: 1. Concentration risk, 2. Diversification quality, 3. Overall risk level."""
+Provide assessment of: 1. Concentration risk, 2. Diversification quality, 3. Geographic/sector-specific risks."""
         }
 
         for key, prompt in sections.items():
@@ -186,7 +291,16 @@ Provide assessment of: 1. Concentration risk, 2. Diversification quality, 3. Ove
         return explanations
     
     def save_explanations(self, portfolio: Dict, explanations: Dict):
-        """Save explanations to JSON."""
+        """
+        Save explanations to JSON file.
+        
+        Args:
+            portfolio: Portfolio metadata from get_portfolio()
+            explanations: LLM-generated explanations from generate_explanations()
+            
+        Returns:
+            None
+        """
         output = {
             'portfolio_metadata': {
                 'strategy': portfolio['strategy'],
@@ -204,7 +318,21 @@ Provide assessment of: 1. Concentration risk, 2. Diversification quality, 3. Ove
 
 
 def main():
-    """Main execution."""
+    """
+    Main execution function.
+    
+    Steps:
+    1. Initialize PortfolioExplainer and load data
+    2. Extract portfolio for analysis (first strategy, 2021)
+    3. Generate AI explanations using few-shot prompting
+    4. Save explanations to JSON output file
+    
+    Args:
+        None
+        
+    Returns:
+        None
+    """
     explainer = PortfolioExplainer()
     explainer.load_data()
     
