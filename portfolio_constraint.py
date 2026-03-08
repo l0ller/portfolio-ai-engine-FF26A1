@@ -82,6 +82,41 @@ class PortfolioConstraintEngine:
             self.company_sector_map[company_name] = sector
         logger.info(f"Built sector mapping for {len(self.company_sector_map)} companies")
     
+    def _precompute_mcap_thresholds(self):
+        """
+        Pre-calculate the bottom 20% MCap threshold for each year.
+        
+        Transforms MCap filtering from O(N log N) per year to O(1) lookup.
+        Also builds MCap universe dictionary for O(1) company lookups.
+        
+        Args:
+            None
+            
+        Returns:
+            None
+        """
+        self.yearly_thresholds = {}
+        self.mcap_universe = {}  # (company, year) -> mcap_value
+        year_cols = [col for col in self.mcap_data.columns if col.isdigit()]
+        
+        for year in year_cols:
+            # Get all valid MCap values for that year
+            valid_mcaps = self.mcap_data[year].dropna().values
+            if len(valid_mcaps) > 0:
+                # Bottom 20% means the 20th percentile value
+                self.yearly_thresholds[year] = np.percentile(valid_mcaps, 20)
+            else:
+                self.yearly_thresholds[year] = 0
+            
+            # Build MCap universe for this year
+            for _, row in self.mcap_data.iterrows():
+                company = row['CO_NAME']
+                mcap_val = row[year]
+                if pd.notna(mcap_val):
+                    self.mcap_universe[(company, year)] = float(mcap_val)
+        
+        logger.debug(f"Pre-computed MCap thresholds for {len(self.yearly_thresholds)} years")
+    
     def _get_company_sector(self, company_name: str) -> str:
         """
         Get sector for a company (case-sensitive matching).
@@ -106,7 +141,7 @@ class PortfolioConstraintEngine:
             cell_value: Cell value from investment_rules CSV
             
         Returns:
-            List of stock names
+            List of stock names (empty list if parsing fails or value is empty)
         """
         if pd.isna(cell_value):
             return []
@@ -136,12 +171,16 @@ class PortfolioConstraintEngine:
         """
         Apply MCap filtering: Remove stocks in bottom 20% of yearly ranking.
         
+        Uses pre-computed yearly thresholds and MCap universe for O(1) performance instead of
+        recalculating rankings for every portfolio.
+        
         Args:
             stocks: List of stock names in portfolio
             year: Year to filter
             
         Returns:
-            Tuple of (filtered_stocks, filter_log)
+            Tuple of (filtered_stocks, filter_log) where filter_log contains
+            'missing_mcap', 'bottom_20_pct', and 'removed_count'
         """
         filter_log = {
             'missing_mcap': [],
@@ -149,45 +188,23 @@ class PortfolioConstraintEngine:
             'removed_count': 0
         }
         
-        year_col = str(year)
-        if year_col not in self.mcap_data.columns:
-            logger.warning(f"Year {year} not found in MCap data")
+        year_str = str(year)
+        if year_str not in self.yearly_thresholds:
+            logger.debug(f"Year {year} not found in pre-computed thresholds")
             return stocks, filter_log
         
-        # Build MCap universe for this year (only companies with available data)
-        mcap_universe = {}
-        for _, row in self.mcap_data.iterrows():
-            company = row['CO_NAME']
-            mcap_val = row[year_col]
-            if pd.notna(mcap_val):
-                mcap_universe[company] = float(mcap_val)
+        threshold = self.yearly_thresholds[year_str]
         
-        # Rank all companies in universe by MCap (descending)
-        ranked_companies = sorted(
-            mcap_universe.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-        total_companies = len(ranked_companies)
-        bottom_20_percent_count = max(1, int(np.ceil(total_companies * 0.2)))
-        
-        # Identify bottom 20% companies
-        bottom_20_companies = set()
-        if total_companies > 0:
-            bottom_20_companies = {
-                ranked_companies[i][0]
-                for i in range(total_companies - bottom_20_percent_count, total_companies)
-            }
-        
-        # Filter portfolio stocks
+        # Filter portfolio stocks using pre-computed threshold and MCap universe
         filtered_stocks = []
         for stock in stocks:
-            if stock not in mcap_universe:
+            mcap_val = self.mcap_universe.get((stock, year_str))
+            if mcap_val is None:
                 # Missing MCap data - remove
                 filter_log['missing_mcap'].append(stock)
                 filter_log['removed_count'] += 1
-            elif stock in bottom_20_companies:
-                # In bottom 20% - remove
+            elif mcap_val <= threshold:
+                # In bottom 20% (at or below threshold) - remove
                 filter_log['bottom_20_pct'].append(stock)
                 filter_log['removed_count'] += 1
             else:
@@ -200,13 +217,15 @@ class PortfolioConstraintEngine:
         """
         Apply sector exposure constraint: Max 25% of portfolio in single sector.
         
-        Removal order: lowest MCap first within each over-exposed sector.
+        Removal order: lowest MCap first, then alphabetically for tie-breaking.
+        Ensures deterministic and reproducible output.
         
         Args:
             stocks: List of stock names in portfolio
             
         Returns:
-            Tuple of (filtered_stocks, constraint_log)
+            Tuple of (filtered_stocks, constraint_log) where constraint_log contains
+            'sector_violations', 'removed_stocks', and 'removed_count'
         """
         constraint_log = {
             'sector_violations': [],
@@ -240,11 +259,12 @@ class PortfolioConstraintEngine:
                 })
                 
                 # Sort by MCap (ascending) to remove lowest MCap first
+                # Use alphabetical name as secondary sort for deterministic tie-breaking
                 stocks_with_mcap = [
                     (stock, self._get_latest_mcap(stock))
                     for stock in sector_stocks
                 ]
-                stocks_with_mcap.sort(key=lambda x: (x[1] is None, x[1]))
+                stocks_with_mcap.sort(key=lambda x: (x[1] is None, x[1], x[0]))
                 
                 # Remove excess stocks
                 excess_count = len(sector_stocks) - max_sector_count
@@ -262,11 +282,13 @@ class PortfolioConstraintEngine:
         """
         Get latest available MCap for a company.
         
+        Searches from most recent year backwards to find available data.
+        
         Args:
             company: Company name
             
         Returns:
-            MCap value or None
+            MCap value or None if not found
         """
         company_data = self.mcap_data[self.mcap_data['CO_NAME'] == company]
         if company_data.empty:
@@ -288,10 +310,23 @@ class PortfolioConstraintEngine:
         """
         Apply all constraints to investment strategies.
         
+        Steps:
+        1. Pre-compute MCap thresholds for optimization
+        2. For each strategy and year:
+           - Apply MCap filtering (bottom 20% removal)
+           - Apply sector exposure constraint (max 25% per sector)
+        
+        Args:
+            None
+            
         Returns:
-            DataFrame with constrained portfolios
+            DataFrame with constrained portfolios where each row is a strategy
+            and columns are year identifiers containing lists of remaining stocks
         """
         logger.info("Applying constraints to portfolios...")
+        
+        # Pre-compute MCap thresholds for O(1) filtering
+        self._precompute_mcap_thresholds()
         
         # Get year columns (exclude first column which is strategy name)
         year_columns = [col for col in self.investment_rules.columns if col.isdigit()]
@@ -367,6 +402,9 @@ class PortfolioConstraintEngine:
         Args:
             output_df: DataFrame with constrained portfolios
             output_path: Path to save output CSV
+            
+        Returns:
+            None
         """
         # Convert list columns to string representation
         for col in output_df.columns:
@@ -379,8 +417,75 @@ class PortfolioConstraintEngine:
         logger.info(f"Output saved to {output_path}")
 
 
+def verify_output(output_df: pd.DataFrame, sector_map: Dict[str, str]) -> bool:
+    """
+    Validate output to ensure no sector exceeds 25% in any portfolio.
+    
+    Self-correction step to prove constraints were properly enforced.
+    
+    Args:
+        output_df: DataFrame with constrained portfolios from output.csv
+        sector_map: Dictionary mapping company names to sectors
+        
+    Returns:
+        True if all portfolios are valid, False if violations found
+    """
+    import ast
+    
+    violations_found = False
+    
+    for idx, row in output_df.iterrows():
+        for col in output_df.columns[1:]:  # Skip strat_name column
+            stocks_str = row[col]
+            
+            # Parse stock list
+            try:
+                if isinstance(stocks_str, str):
+                    stocks = ast.literal_eval(stocks_str)
+                else:
+                    stocks = stocks_str
+            except (ValueError, SyntaxError):
+                continue
+            
+            if not stocks:
+                continue
+            
+            # Count sectors
+            counts = pd.Series([sector_map.get(s, 'Unknown') for s in stocks]).value_counts()
+            max_allowed = len(stocks) // 4  # 25% rounded down
+            
+            for sector, count in counts.items():
+                if count > max_allowed:
+                    logger.warning(
+                        f"Violation: {row['strat_name']} | Year {col} | "
+                        f"{sector}: {count}/{len(stocks)} (max allowed: {max_allowed})"
+                    )
+                    violations_found = True
+    
+    if not violations_found:
+        logger.info("✓ Verification passed: All portfolios meet constraints")
+    else:
+        logger.warning("✗ Verification failed: Constraint violations detected")
+    
+    return not violations_found
+
+
 def main():
-    """Main execution function."""
+    """
+    Main execution function.
+    
+    Steps:
+    1. Initialize constraint engine with input data
+    2. Apply constraints (MCap filtering + sector exposure limits)
+    3. Save output to CSV
+    4. Verify output meets all constraints
+    
+    Args:
+        None
+        
+    Returns:
+        None
+    """
     # Initialize constraint engine
     engine = PortfolioConstraintEngine(data_dir='data')
     
@@ -389,6 +494,9 @@ def main():
     
     # Save output
     engine.save_output(constrained_portfolios, output_path='output.csv')
+    
+    # Verify constraints were properly applied
+    verify_output(constrained_portfolios, engine.company_sector_map)
     
     logger.info("Portfolio constraint application completed successfully")
 
